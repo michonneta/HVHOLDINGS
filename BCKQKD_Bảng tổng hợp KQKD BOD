@@ -1,0 +1,317 @@
+-- ================= DOANH SỐ =================
+WITH doanhso AS (
+    SELECT
+        thang,
+        thitruong,
+        bu_phongban,
+        'Khối Kinh doanh' AS khoi,
+        muc,
+        danhmuc,
+        nhom,
+        chitiet,
+        SUM(amount) AS amount
+    FROM `hv-data.hv_fin.fin_orders`
+    GROUP BY
+        thang,
+        thitruong,
+        bu_phongban,
+        khoi,
+        muc,
+        danhmuc,
+        nhom,
+        chitiet
+    HAVING muc = 'Doanh số'
+),
+
+-- ================= LƯƠNG =================
+
+params AS (
+    SELECT
+        CURRENT_DATE() AS today,
+
+        -- Tháng forecast (T)
+        FORMAT_DATE('%Y-%m', DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH)) AS thang_T,
+
+        -- Tháng actual gần nhất (T-1)
+        FORMAT_DATE('%Y-%m', DATE_SUB(CURRENT_DATE(), INTERVAL 2 MONTH)) AS thang_T_minus_1,
+
+        -- Mốc khoá trong tháng T+1
+        DATE_TRUNC(CURRENT_DATE(), MONTH) + INTERVAL 5 DAY  AS moc_5,
+        DATE_TRUNC(CURRENT_DATE(), MONTH) + INTERVAL 20 DAY AS moc_20
+),
+
+-- =========================
+-- SALARY ACTUAL (AGG)
+-- =========================
+salary_base AS (
+    SELECT
+        thang,
+        thitruong,
+        bu_phongban,
+        khoi,
+        danh_muc,
+        nhom,
+        chitiet,
+        SUM(amount) AS amount
+    FROM `hv-data.hv_fin.fin_salary`
+    GROUP BY
+        thang,
+        thitruong,
+        bu_phongban,
+        khoi,
+        danh_muc,
+        nhom,
+        chitiet
+),
+
+-- =========================
+-- DOANH THU GROWTH (T vs T-1)
+-- =========================
+doanhthu_growth AS (
+    WITH rev AS (
+        SELECT
+            thang,
+            thitruong,
+            bu_phongban,
+            SUM(amount) AS revenue
+        FROM `hv-data.hv_fin.fin_orders`
+        WHERE danhmuc NOT IN ('Các khoản giảm trừ')
+        GROUP BY
+            thang,
+            thitruong,
+            bu_phongban
+    )
+    SELECT
+        cur.thitruong,
+        cur.bu_phongban,
+        SAFE_DIVIDE(cur.revenue - prev.revenue, prev.revenue) AS growth_rate
+    FROM rev cur
+    LEFT JOIN rev prev
+        ON prev.thitruong   = cur.thitruong
+       AND prev.bu_phongban = cur.bu_phongban
+       AND prev.thang = FORMAT_DATE(
+            '%Y-%m',
+            DATE_SUB(PARSE_DATE('%Y-%m', cur.thang), INTERVAL 1 MONTH)
+       )
+    WHERE cur.thang = FORMAT_DATE('%Y-%m', DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH))
+),
+
+-- =========================
+-- SALARY FORECAST FOR THÁNG T
+-- =========================
+salary_forecast AS (
+    SELECT
+        p.thang_T AS thang,
+        prev.thitruong,
+        prev.bu_phongban,
+        prev.khoi,
+        'Chi phí' AS muc,
+        prev.danh_muc AS danhmuc,
+        prev.nhom,
+        prev.chitiet,
+
+        CASE
+            -- 🔹 LƯƠNG / BHXH / CHẾ ĐỘ
+            WHEN prev.chitiet IN ('Lương', 'BHXH', 'Chế độ chính sách')
+                 AND p.today < p.moc_5
+            THEN prev.amount
+
+            -- 🔹 THƯỞNG
+            WHEN prev.chitiet = 'Thưởng'
+                 AND p.today < p.moc_20
+            THEN prev.amount * (1 + COALESCE(g.growth_rate, 0))
+
+            -- 🔹 ĐÃ QUA MỐC → LẤY ACTUAL DB
+            ELSE cur.amount
+        END AS amount
+
+    FROM params p
+
+    -- actual T-1 (baseline)
+    JOIN salary_base prev
+        ON prev.thang = p.thang_T_minus_1
+
+    -- actual T (nếu đã có)
+    LEFT JOIN salary_base cur
+        ON cur.thang        = p.thang_T
+       AND cur.thitruong   = prev.thitruong
+       AND cur.bu_phongban = prev.bu_phongban
+       AND cur.khoi        = prev.khoi
+       AND cur.danh_muc    = prev.danh_muc
+       AND cur.nhom        = prev.nhom
+       AND cur.chitiet     = prev.chitiet
+
+    -- % tăng giảm doanh thu
+    LEFT JOIN doanhthu_growth g
+        ON g.thitruong   = prev.thitruong
+       AND g.bu_phongban = prev.bu_phongban
+
+    -- chỉ forecast cho các nhóm cần thiết
+    WHERE prev.chitiet IN ('Lương', 'BHXH', 'Chế độ chính sách', 'Thưởng')
+),
+-- =========================
+-- SALARY ACTUAL
+-- =========================
+
+salary_actual AS (
+    SELECT
+        thang,
+        thitruong,
+        bu_phongban,
+        khoi,
+        'Chi phí' AS muc,
+        danh_muc AS danhmuc,
+        nhom,
+        chitiet,
+        SUM(amount) AS amount
+    FROM `hv-data.hv_fin.fin_salary`
+    WHERE thang < (
+        SELECT thang_T FROM params
+    )
+    GROUP BY
+        thang,
+        thitruong,
+        bu_phongban,
+        khoi,
+        muc,
+        danhmuc,
+        nhom,
+        chitiet
+),
+-- =========================
+-- UNION SALARY ACTUAL & SALARY FORECAST FOR THÁNG T
+-- =========================
+salary AS (
+    SELECT * FROM salary_forecast
+    UNION ALL
+    SELECT * FROM salary_actual
+),
+-- ================= ADS =================
+ads AS (
+    SELECT
+        thang,
+        thitruong,
+        bu_phongban,
+        'Khối Kinh doanh' AS khoi,
+        'Chi phí' AS muc,
+        danhmuc,
+        nhom,
+        chitiet,
+        SUM(amount) AS amount
+    FROM `hv-data.hv_fin.fin_products_ads`
+    WHERE bu_phongban NOT IN ('Minh Google','DTI','HMB')
+    GROUP BY
+        thang,
+        thitruong,
+        bu_phongban,
+        khoi,
+        muc,
+        danhmuc,
+        nhom,
+        chitiet
+),
+
+-- ================= CHI PHÍ KHÁC =================
+chiphikhac AS (
+    SELECT
+        FORMAT_TIMESTAMP('%Y-%m', ngaythanhtoan) AS thang,
+        thitruong,
+        phongban AS bu_phongban,
+        khoi,
+        'Chi phí' AS muc,
+        danhmucchiphi AS danhmuc,
+        nhomchiphi AS nhom,
+        loaichiphi AS chitiet,
+        SUM(tienvnd) AS amount
+    FROM `hv-data.hv_fin.fin_expense_sources`
+    GROUP BY
+        thang,
+        thitruong,
+        phongban,
+        khoi,
+        muc,
+        danhmuc,
+        nhom,
+        chitiet
+),
+-- ================= CHI PHÍ PORTAL =================
+chiphi_portal AS (
+    SELECT
+        thang,
+        thitruong,
+        bu_phongban,
+        'Khối Kinh doanh' AS khoi,
+        muc,
+        danhmuc,
+        nhom,
+        chitiet,
+        SUM(amount) AS amount
+    FROM hv-data.hv_fin.fin_orders
+    GROUP BY
+        thang,
+        thitruong,
+        bu_phongban,
+        khoi,
+        muc,
+        danhmuc,
+        nhom,
+        chitiet
+    HAVING muc = 'Chi phí'
+),
+-- ================= GỘP CHI PHÍ =================
+chiphi AS (
+    SELECT * FROM salary
+    UNION ALL
+    SELECT * FROM ads
+    UNION ALL
+    SELECT * FROM chiphikhac
+    UNION ALL
+    SELECT * FROM chiphi_portal
+),
+
+-- ================= LỢI NHUẬN =================
+loinhuan AS (
+    SELECT
+        thang,
+        thitruong,
+        bu_phongban,
+        khoi,
+        'Lợi nhuận' AS muc,
+        'LỢI NHUẬN' AS danhmuc,
+        'LỢI NHUẬN GỘP' AS nhom,
+        'Lợi nhuận' AS chitiet,
+        SUM(amount) AS amount
+    FROM (
+        -- Doanh số (+)
+        SELECT
+            thang,
+            thitruong,
+            bu_phongban,
+            khoi,
+            amount
+        FROM doanhso
+        WHERE danhmuc NOT IN ('Các khoản giảm trừ')
+
+        UNION ALL
+
+        -- Chi phí (-)
+        SELECT
+            thang,
+            thitruong,
+            bu_phongban,
+            khoi,
+            -amount AS amount
+        FROM chiphi
+    )
+    GROUP BY
+        thang,
+        thitruong,
+        bu_phongban,
+        khoi
+)
+-- ================= BẢNG TỔNG HỢP KQKD BOD =================
+SELECT * FROM doanhso
+UNION ALL
+SELECT * FROM chiphi
+UNION ALL
+SELECT * FROM loinhuan
